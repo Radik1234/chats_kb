@@ -1,0 +1,103 @@
+# Beever Atlas v0.2.0 declarative endpoint catalog.
+# Qwen2.5's bundled chat template supports tool calls; llama.cpp --jinja
+# exposes them through the OpenAI-compatible API. JSON mode is enabled for
+# the consumer that Atlas v0.2.0 declares as structured.
+endpoints:
+  - name: local-qwen
+    preset: custom
+    base_url: ${LLM_CHAT_BASE_URL}
+    auth_type: none
+    models:
+      - qwen2.5-14b-instruct
+    rpm: 120
+    tags:
+      - local
+      - tools
+      - json
+
+  - name: local-bge-m3
+    preset: custom
+    base_url: ${LLM_EMBEDDING_BASE_URL}
+    auth_type: none
+    models:
+      - bge-m3
+    rpm: 600
+    tags:
+      - local
+      - embeddings
+      - 1024d
+
+preset: custom
+
+# Keep this list explicit: these are all 17 consumers in Atlas v0.2.0.
+assignments:
+  embedding:
+    endpoint: local-bge-m3
+    model: bge-m3
+    dimensions: 1024
+
+  fact_extractor:
+    endpoint: local-qwen
+    model: qwen2.5-14b-instruct
+    temperature: 0.1
+  entity_extractor:
+    endpoint: local-qwen
+    model: qwen2.5-14b-instruct
+    temperature: 0.1
+  cross_batch_validator:
+    endpoint: local-qwen
+    model: qwen2.5-14b-instruct
+    temperature: 0.1
+  coreference_resolver:
+    endpoint: local-qwen
+    model: qwen2.5-14b-instruct
+    temperature: 0.1
+  contradiction_detector:
+    endpoint: local-qwen
+    model: qwen2.5-14b-instruct
+    temperature: 0.1
+  image_describer:
+    endpoint: local-qwen
+    model: qwen2.5-14b-instruct
+    temperature: 0.1
+  video_analyzer:
+    endpoint: local-qwen
+    model: qwen2.5-14b-instruct
+    temperature: 0.1
+  audio_transcriber:
+    endpoint: local-qwen
+    model: qwen2.5-14b-instruct
+    temperature: 0.1
+  summarizer:
+    endpoint: local-qwen
+    model: qwen2.5-14b-instruct
+    temperature: 0.2
+  document_digester:
+    endpoint: local-qwen
+    model: qwen2.5-14b-instruct
+    temperature: 0.1
+  echo:
+    endpoint: local-qwen
+    model: qwen2.5-14b-instruct
+    temperature: 0.2
+  wiki_compiler:
+    endpoint: local-qwen
+    model: qwen2.5-14b-instruct
+    temperature: 0.2
+  wiki_maintainer:
+    endpoint: local-qwen
+    model: qwen2.5-14b-instruct
+    temperature: 0.2
+  qa_agent:
+    endpoint: local-qwen
+    model: qwen2.5-14b-instruct
+    temperature: 0.2
+  qa_router:
+    endpoint: local-qwen
+    model: qwen2.5-14b-instruct
+    temperature: 0.1
+  csv_mapper:
+    endpoint: local-qwen
+    model: qwen2.5-14b-instruct
+    temperature: 0.1
+    response_format: json
