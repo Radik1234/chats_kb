@@ -1,0 +1,12 @@
+.env
+*.log
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+data/
+backups/
+.DS_Store
+Thumbs.db
+services/**/wheels/

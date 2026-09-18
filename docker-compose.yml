@@ -1,0 +1,126 @@
+services:
+  opensearch:
+    image: opensearchproject/opensearch:${OPENSEARCH_VERSION:-3.8.0}
+    container_name: onec-kb-opensearch
+    environment:
+      - discovery.type=single-node
+      - cluster.name=onec-kb
+      - node.name=opensearch
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_JAVA_OPTS=${OPENSEARCH_JAVA_OPTS:--Xms2g -Xmx2g}
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    mem_limit: 6g
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    ports:
+      - "127.0.0.1:9200:9200"
+    networks:
+      - onec-kb
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl -sk -u admin:$$OPENSEARCH_INITIAL_ADMIN_PASSWORD https://localhost:9200/_cluster/health | grep -qE '"status":"(green|yellow)"'
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 90s
+    restart: unless-stopped
+
+  dashboards:
+    image: opensearchproject/opensearch-dashboards:${OPENSEARCH_VERSION:-3.8.0}
+    container_name: onec-kb-dashboards
+    environment:
+      OPENSEARCH_HOSTS: '["https://opensearch:9200"]'
+      OPENSEARCH_USERNAME: ${OPENSEARCH_USERNAME:-admin}
+      OPENSEARCH_PASSWORD: ${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
+      OPENSEARCH_SSL_VERIFICATIONMODE: none
+      SERVER_HOST: 0.0.0.0
+      SERVER_NAME: onec-kb-dashboards
+    ports:
+      - "127.0.0.1:5601:5601"
+    networks:
+      - onec-kb
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    mem_limit: 1g
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl -sf http://localhost:5601/app/login >/dev/null || exit 1
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+
+  mcp:
+    profiles: ["mcp"]
+    build:
+      context: ./services/mcp
+    image: onec-kb-mcp:local
+    container_name: onec-kb-mcp
+    environment:
+      OPENSEARCH_URL: https://opensearch:9200
+      OPENSEARCH_USERNAME: ${OPENSEARCH_USERNAME:-admin}
+      OPENSEARCH_PASSWORD: ${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
+      OPENSEARCH_SSL_VERIFY: "false"
+    command:
+      - python
+      - -m
+      - mcp_server_opensearch
+      - --transport
+      - stream
+      - --host
+      - 0.0.0.0
+      - --port
+      - "9900"
+    ports:
+      - "127.0.0.1:${MCP_PORT:-9900}:9900"
+    networks:
+      - onec-kb
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    mem_limit: 512m
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import socket; s=socket.create_connection(('127.0.0.1',9900),2); s.close()"
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  import:
+    profiles: ["import"]
+    build:
+      context: ./services/import
+    image: onec-kb-import:local
+    environment:
+      OPENSEARCH_URL: https://opensearch:9200
+      OPENSEARCH_USERNAME: ${OPENSEARCH_USERNAME:-admin}
+      OPENSEARCH_PASSWORD: ${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
+      OPENSEARCH_SSL_VERIFY: "false"
+    volumes:
+      - ./chats_history:/data/chats_history:ro
+    networks:
+      - onec-kb
+    depends_on:
+      opensearch:
+        condition: service_healthy
+
+volumes:
+  opensearch-data:
+
+networks:
+  onec-kb:
+    name: onec-kb
