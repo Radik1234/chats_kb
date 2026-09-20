@@ -5,7 +5,9 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
-data/
+data/**
+!data/telegram/
+!data/telegram/README.md
 backups/
 .DS_Store
 Thumbs.db

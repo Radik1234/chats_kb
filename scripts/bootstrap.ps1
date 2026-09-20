@@ -22,6 +22,10 @@ try {
     Write-Warning "Could not set vm.max_map_count. If OpenSearch fails, run: wsl -d docker-desktop -- /sbin/sysctl -w vm.max_map_count=262144"
 }
 
+foreach ($zone in @("inbox", "processing", "archive", "failed", "logs")) {
+    New-Item -ItemType Directory -Force (Join-Path $Root "data\telegram\$zone") | Out-Null
+}
+
 if (-not $SkipUp) {
     docker compose up -d
     docker compose ps

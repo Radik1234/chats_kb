@@ -100,23 +100,54 @@ services:
       start_period: 20s
     restart: unless-stopped
 
-  import:
-    profiles: ["import"]
+  ingest:
     build:
       context: ./services/import
-    image: onec-kb-import:local
+    image: onec-kb-ingest:local
+    container_name: onec-kb-ingest
     environment:
       OPENSEARCH_URL: https://opensearch:9200
       OPENSEARCH_USERNAME: ${OPENSEARCH_USERNAME:-admin}
       OPENSEARCH_PASSWORD: ${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
       OPENSEARCH_SSL_VERIFY: "false"
+      OPENSEARCH_MAX_SHARDS_PER_NODE: ${OPENSEARCH_MAX_SHARDS_PER_NODE:-3000}
+      INGEST_ROOT: /data/telegram
+      INGEST_CHUNK_INTERVAL_SEC: ${INGEST_CHUNK_INTERVAL_SEC:-10}
+      INGEST_POLL_INTERVAL_SEC: ${INGEST_POLL_INTERVAL_SEC:-30}
+      INGEST_STABLE_SEC: ${INGEST_STABLE_SEC:-5}
+      INGEST_SKIP_SERVICE: ${INGEST_SKIP_SERVICE:-true}
+      INGEST_SKIP_EMPTY: ${INGEST_SKIP_EMPTY:-true}
     volumes:
+      - ./data/telegram:/data/telegram
+    networks:
+      - onec-kb
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    mem_limit: 512m
+    restart: unless-stopped
+
+  import:
+    profiles: ["import"]
+    image: onec-kb-ingest:local
+    environment:
+      OPENSEARCH_URL: https://opensearch:9200
+      OPENSEARCH_USERNAME: ${OPENSEARCH_USERNAME:-admin}
+      OPENSEARCH_PASSWORD: ${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
+      OPENSEARCH_SSL_VERIFY: "false"
+      OPENSEARCH_MAX_SHARDS_PER_NODE: ${OPENSEARCH_MAX_SHARDS_PER_NODE:-3000}
+      INGEST_CHUNK_INTERVAL_SEC: ${INGEST_CHUNK_INTERVAL_SEC:-10}
+      INGEST_SKIP_SERVICE: ${INGEST_SKIP_SERVICE:-true}
+      INGEST_SKIP_EMPTY: ${INGEST_SKIP_EMPTY:-true}
+    volumes:
+      - ./data/telegram:/data/telegram
       - ./chats_history:/data/chats_history:ro
     networks:
       - onec-kb
     depends_on:
       opensearch:
         condition: service_healthy
+    entrypoint: ["python", "-u", "/app/import_telegram.py"]
 
 volumes:
   opensearch-data:

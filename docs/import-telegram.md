@@ -1,171 +1,136 @@
 # Импорт истории Telegram
 
-Импортёр читает JSON-экспорт **Telegram Desktop** и создаёт индекс OpenSearch
-на один снимок одного чата. Формат имени:
+Ингest-сервис читает JSON-экспорт **Telegram Desktop** из каталога `inbox`
+и создаёт **по одному индексу OpenSearch на календарный день сообщений**:
 
 ```text
 {telegram_chat_id}_{slug}_{YYYY-MM-DD}
 ```
 
-Пример: `1393071168_mssqlplus1c_2025-07-18`
+Примеры: `1393071168_mssqlplus1c_2026-09-17`, `1393071168_mssqlplus1c_2026-09-18`.
 
-- `telegram_chat_id` — поле `id` из `result.json` (не из имени файла).
-- `slug` — короткое имя чата: из папки `{id}_{slug}`, либо `-Slug`, либо
-  транслитерация `name`.
-- `YYYY-MM-DD` — **дата снимка, которую вы задаёте**. Это идентификатор
-  версии выгрузки (дата экспорта, контрольная дата, дата импорта), а не
-  автоматически вычисленный диапазон сообщений. Диапазон дат сообщений
-  пишется в каталог `kb_catalog`.
+Дата в имени индекса берётся из поля `date` сообщения (`2020-09-19T21:20:37` →
+`2020-09-19`), не из имени файла и не из даты импорта. Имя файла может быть
+любым (`result.json`, `2026-09-18.json`).
 
-Повторный импорт в тот же индекс идемпотентен: документ
-`{chat_id}_{message_id}` перезаписывается.
+Алиас `{chat_id}_{slug}` (пример: `1393071168_mssqlplus1c`) указывает на **все**
+дневные индексы этого чата.
 
-## 1. Экспорт из Telegram Desktop
+## 1. Каталоги и маршрут файлов
 
-1. Откройте нужный групповой чат.
-2. Меню → **Export chat history**.
-3. Формат: **JSON**. Медиа можно не включать (индексируется только текст).
-4. Не переименовывайте поля `id`, `name`, `type`, `messages`, `text`,
-   `from_id`, `reply_to_message_id`.
-5. Положите `result.json` в каталог:
+Рабочее дерево (создаёт `bootstrap.ps1` и сам ingest):
 
 ```text
-chats_history/{telegram_chat_id}_{slug}/result.json
+data/telegram/
+  inbox/{chat_id}_{slug}/          # кладёт ответственный
+  processing/{chat_id}_{slug}/     # файл взят в работу, не трогать
+  archive/{chat_id}_{slug}/        # успешно обработан
+  failed/{chat_id}_{slug}/         # ошибка разбора или записи
+  logs/
 ```
 
-`slug` — латиница и цифры, без пробелов, например `mssqlplus1c`,
-`buh_erp`, `zup`. Так индекс будет читаемым.
+`{chat_id}_{slug}` — папка чата, латиница и цифры, без пробелов. Пример:
+`1393071168_mssqlplus1c`. `chat_id` должен совпадать с полем `id` внутри JSON.
 
-Файл может лежать в любом другом месте: скрипт монтирует родительский
-каталог в контейнер импорта.
+Откуда взялся файл в любой зоне — видно по пути:
 
-## 2. Что попадает в индекс
-
-| Берём | Пропускаем |
+| Часть пути | Смысл |
 | --- | --- |
-| `type=message` с непустым текстом | service (инвайты, кики, смена названия) |
-| текст-строка и составной `text[]` | пустые сообщения (стикеры/фото без подписи) |
-| `reply_to_message_id`, автор, время | вложения как файлы (в выгрузке их нет) |
+| `inbox` / `processing` / `archive` / `failed` | этап |
+| `{chat_id}_{slug}` | какой чат |
+| в archive/failed: `{UTC}__{исходное_имя}` | когда сервис закончил и как файл назывался в inbox |
 
-Производные поля: `has_links`, `has_logs`, `error_codes`, `is_bot`
-(`via_bot` и известные боты).
+Пример: `archive/1393071168_mssqlplus1c/20260917T183331Z__result.json` —
+выгрузка чата `1393071168_mssqlplus1c`, исходное имя `result.json`, обработка
+завершена 2026-09-17 18:33:31 UTC.
 
-## 3. Загрузка любого чата
+Маршрут:
 
-Стек должен быть запущен (`.\scripts\bootstrap.ps1`).
+1. Оператор кладёт JSON в `inbox/{chat_id}_{slug}/`.
+2. Сервис ждёт, пока размер файла стабилен `INGEST_STABLE_SEC` секунд (копия не идёт).
+3. Перенос в `processing/{chat_id}_{slug}/` с тем же именем.
+4. Загрузка недостающих дней в OpenSearch.
+5. Успех → `archive/.../{UTC}__{имя}`. Ошибка → `failed/.../{UTC}__{имя}`.
+
+`chats_history/` в репозитории — эталон для отладки, ingest его не читает.
+Скопируйте оттуда в inbox:
+
+```powershell
+New-Item -ItemType Directory -Force data\telegram\inbox\1393071168_mssqlplus1c | Out-Null
+Copy-Item chats_history\1393071168_mssqlplus1c\result.json data\telegram\inbox\1393071168_mssqlplus1c\
+```
+
+## 2. Экспорт из Telegram Desktop
+
+1. Откройте групповой чат.
+2. Меню → **Export chat history**.
+3. Формат: **JSON**. Медиа можно не включать.
+4. Не переименовывайте поля `id`, `name`, `type`, `messages`, `text`,
+   `from_id`, `reply_to_message_id`, `date`.
+5. Выгрузка за годы и выгрузка за один день — один и тот же формат. Положите
+   файл в `inbox/{chat_id}_{slug}/`.
+
+## 3. Что попадает в индекс
+
+Фильтры задаются в `.env` (по умолчанию включены):
+
+- `INGEST_SKIP_SERVICE=true` — не грузить `type=service` (инвайты, кики).
+- `INGEST_SKIP_EMPTY=true` — не грузить сообщения без текста.
+
+Индексируются текстовые сообщения; `text` склеивается из строки или массива
+сущностей. Производные поля: `has_links`, `has_logs`, `error_codes`, `is_bot`.
+
+Индекс на день **не создаётся**, если после фильтра в этот день нет сообщений.
+
+## 4. Порции и уже загруженные дни
+
+Одна порция = все подходящие сообщения **одного календарного дня**.
+
+1. Файл читается целиком, сообщения группируются по `date[:10]`.
+2. Сервис смотрит существующие индексы `{chat_id}_{slug}_YYYY-MM-DD`.
+3. Дни, для которых индекс уже есть, **пропускаются целиком**. Если в файле
+   есть 2026-09-17 и 2026-09-18, а 17-е уже в кластере — в OpenSearch уйдёт
+   только 18-е.
+4. Новые дни грузятся по одному: create → bulk → refresh → `kb_catalog` →
+   добавление в алиас чата.
+5. Между порциями пауза `INGEST_CHUNK_INTERVAL_SEC` (по умолчанию **10**).
+   После последней порции файла паузы нет.
+6. Файл попадает в `archive` только если все запланированные дни записаны
+   без ошибки.
+
+Документ: `_id` = `{chat_id}_{message_id}`.
+
+Повтор той же выгрузки безопасен: все дни уже есть → 0 порций, файл всё равно
+уходит в archive.
+
+Историческая выгрузка на годы при интервале 10 с займёт много времени
+(число дней с сообщениями × 10 с). Для отладки временно поставьте
+`INGEST_CHUNK_INTERVAL_SEC=0` в `.env` и пересоздайте контейнер `ingest`.
+
+## 5. Запуск
+
+Стек с ingest:
+
+```powershell
+.\scripts\bootstrap.ps1
+```
+
+Сервис `onec-kb-ingest` смотрит `data/telegram/inbox`. После копии JSON в
+inbox дождитесь появления файла в `archive`.
+
+Ручной прогон одного файла без watcher (отладка):
 
 ```powershell
 .\scripts\import-chat.ps1 `
   -Path .\chats_history\1393071168_mssqlplus1c\result.json `
-  -SnapshotDate 2025-07-18
+  -ChunkIntervalSec 0
 ```
 
-Другой чат:
+## 6. Поиск
 
-```powershell
-.\scripts\import-chat.ps1 `
-  -Path .\chats_history\123456789_buh_erp\result.json `
-  -SnapshotDate 2026-09-01
-```
+- Конкретный день: `GET 1393071168_mssqlplus1c_2026-09-17/_search`
+- Весь чат: `GET 1393071168_mssqlplus1c/_search`
+- Реестр дней: `GET kb_catalog/_search`
 
-Явный slug, если папка не в формате `{id}_{slug}`:
-
-```powershell
-.\scripts\import-chat.ps1 `
-  -Path C:\exports\result.json `
-  -SnapshotDate 2026-09-17 `
-  -Slug mssqlplus1c
-```
-
-Полное имя индекса вручную:
-
-```powershell
-.\scripts\import-chat.ps1 `
-  -Path .\chats_history\1393071168_mssqlplus1c\result.json `
-  -SnapshotDate 2025-07-18 `
-  -IndexName 1393071168_mssqlplus1c_2025-07-18
-```
-
-Пересоздать индекс с тем же именем (удалит предыдущий снимок):
-
-```powershell
-.\scripts\import-chat.ps1 `
-  -Path .\chats_history\1393071168_mssqlplus1c\result.json `
-  -SnapshotDate 2025-07-18 `
-  -Recreate
-```
-
-Проверка без записи в OpenSearch:
-
-```powershell
-.\scripts\import-chat.ps1 `
-  -Path .\chats_history\1393071168_mssqlplus1c\result.json `
-  -SnapshotDate 2025-07-18 `
-  -DryRun
-```
-
-Тот же вызов напрямую через Python (так работает импорт на этой машине):
-
-```powershell
-python .\services\import\import_telegram.py `
-  --file .\chats_history\1393071168_mssqlplus1c\result.json `
-  --snapshot-date 2025-07-18
-```
-
-Через Compose (образ импортёра без внешних зависимостей):
-
-```powershell
-docker compose --profile import run --rm `
-  -v "${PWD}/chats_history/1393071168_mssqlplus1c:/data/import:ro" `
-  import --file /data/import/result.json --snapshot-date 2025-07-18
-```
-
-## 4. Несколько снимков одного чата
-
-Каждая дата — отдельный индекс:
-
-- `1393071168_mssqlplus1c_2025-07-18`
-- `1393071168_mssqlplus1c_2026-09-17`
-
-Алиас `{chat_id}_{slug}` (пример: `1393071168_mssqlplus1c`) всегда указывает
-на **последний успешно импортированный** снимок этого чата.
-
-Искать по конкретному снимку:
-
-```text
-GET 1393071168_mssqlplus1c_2025-07-18/_search
-```
-
-Искать по последнему снимку:
-
-```text
-GET 1393071168_mssqlplus1c/_search
-```
-
-Список всех загруженных чатов:
-
-```text
-GET kb_catalog/_search
-```
-
-В `kb_catalog` для каждого индекса есть `chat_name`, `snapshot_date`,
-`message_count`, `date_min`, `date_max`, `alias`.
-
-## 5. Поиск в Dashboards
-
-1. http://127.0.0.1:5601 → войти как `admin`.
-2. Stack Management → Index Patterns → создать:
-   - `kb_catalog` — реестр чатов;
-   - `1393071168_mssqlplus1c_*` — все снимки одного чата;
-   - или `*_????-??-??` — все чаты.
-3. Discover: поле `text`, фильтры `user_name.keyword`, `has_logs`,
-   `timestamp`.
-
-Пример REST:
-
-```powershell
-$password = ((Get-Content .env | Where-Object { $_ -match '^OPENSEARCH_INITIAL_ADMIN_PASSWORD=' }) -split '=',2)[1]
-curl.exe -sk -u "admin:$password" -H "Content-Type: application/json" `
-  -d "{\"query\":{\"match\":{\"text\":\"tempdb\"}}}" `
-  https://127.0.0.1:9200/1393071168_mssqlplus1c/_search
-```
+В Dashboards: index pattern `1393071168_mssqlplus1c_*` или алиас
+`1393071168_mssqlplus1c`. Поле времени — `timestamp`.

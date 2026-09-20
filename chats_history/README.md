@@ -1,17 +1,21 @@
-# Выгрузки Telegram
+# Исходные выгрузки (архив репозитория)
 
-Кладём сюда JSON-экспорт Telegram Desktop. Имя папки задаёт slug индекса:
+Здесь лежит эталонный JSON для отладки. Рабочий конвейер ingest **не читает**
+этот каталог.
+
+Чтобы загрузить чат:
+
+1. Скопируйте файл в inbox:
 
 ```text
-chats_history/
-  {telegram_chat_id}_{slug}/
-    result.json
+data/telegram/inbox/{telegram_chat_id}_{slug}/result.json
 ```
 
-Пример: `1393071168_mssqlplus1c/result.json` → индекс
-`1393071168_mssqlplus1c_YYYY-MM-DD`.
+Пример:
 
-Если структура другая, slug можно передать явно: `.\scripts\import-chat.ps1 -Slug ...`.
+```powershell
+New-Item -ItemType Directory -Force data\telegram\inbox\1393071168_mssqlplus1c | Out-Null
+Copy-Item chats_history\1393071168_mssqlplus1c\result.json data\telegram\inbox\1393071168_mssqlplus1c\
+```
 
-Как экспортировать чат и импортировать его в OpenSearch — в
-[docs/import-telegram.md](../docs/import-telegram.md).
+2. Дальше файлом занимается сервис `ingest` — см. [docs/import-telegram.md](../docs/import-telegram.md).
