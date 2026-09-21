@@ -18,7 +18,7 @@ def main() -> int:
     catalog = client.request(
         "POST",
         "/kb_catalog/_search",
-        {"query": {"term": {"alias": ALIAS}}, "size": 3, "sort": [{"message_date": "desc"}]},
+        {"query": {"term": {"alias": ALIAS}}, "size": 3, "sort": [{"month": "desc"}]},
     )
     total = catalog.get("hits", {}).get("total", {})
     print("catalog_total", total)
@@ -33,8 +33,10 @@ def main() -> int:
             src.get("index_name"),
             "messages",
             src.get("message_count"),
-            "date",
-            src.get("message_date"),
+            "month",
+            src.get("month"),
+            "days",
+            len(src.get("days") or []),
         )
     search = client.request(
         "POST",

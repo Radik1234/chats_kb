@@ -43,7 +43,7 @@ docker compose ps
 | --- | --- | --- |
 | OpenSearch | https://127.0.0.1:9200 | REST, индексы, поиск |
 | Dashboards | http://127.0.0.1:5601 | UI поиска и Discover |
-| ingest | (нет внешнего порта) | JSON из `data/telegram/inbox` → дневные индексы |
+| ingest | (нет внешнего порта) | JSON из `data/telegram/inbox` → месячные индексы |
 | MCP | http://127.0.0.1:9900/mcp | инструменты для AI-агентов |
 
 Сертификат OpenSearch — demo/self-signed. Для `curl` используйте `-k`.
@@ -56,7 +56,7 @@ curl.exe -sk -u "admin:$password" https://127.0.0.1:9200
 ```
 
 В Dashboards войдите как `admin` с тем же паролем. Создайте index pattern
-`kb_catalog` (реестр дней) и `1393071168_mssqlplus1c_*` или алиас
+`kb_catalog` (реестр месяцев) и `1393071168_mssqlplus1c_*` или алиас
 `1393071168_mssqlplus1c`. Поле времени — `timestamp`.
 
 ## 4. Остановка

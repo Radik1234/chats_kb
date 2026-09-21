@@ -44,8 +44,8 @@ python .\scripts\pull_docker_image.py opensearchproject/opensearch:3.8.0 opensea
 
 После подключения у агента появляются инструменты OpenSearch (`ListIndex`,
 `SearchIndex` и др.). Имеет смысл сначала смотреть `kb_catalog`, затем
-искать в индексе `{chat_id}_{slug}` или в конкретном снимке
-`{chat_id}_{slug}_{YYYY-MM-DD}`.
+искать в индексе `{chat_id}_{slug}` или в конкретном месяце
+`{chat_id}_{slug}_{YYYY-MM}` (день — фильтр по `message_date`).
 
 ## Проверка, что порт жив
 

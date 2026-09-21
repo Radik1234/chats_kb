@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Import Telegram Desktop JSON into daily OpenSearch indices.
+"""Import Telegram Desktop JSON into monthly OpenSearch indices.
 
-Index name: {chat_id}_{slug}_{YYYY-MM-DD}  (calendar day of the message)
-Example:    1393071168_mssqlplus1c_2026-09-17
+Index name: {chat_id}_{slug}_{YYYY-MM}  (calendar month of the message)
+Example:    1393071168_mssqlplus1c_2026-09
+
+The calendar day of every message is preserved in the ``message_date`` field, so
+"per day" queries are a filter on ``message_date`` instead of an index per day.
+Import stays idempotent per day: days already present in a month index are not
+re-indexed.
 """
 
 from __future__ import annotations
@@ -27,7 +32,7 @@ LOGGER = logging.getLogger("import_telegram")
 
 CATALOG_INDEX = "kb_catalog"
 DEFAULT_CHUNK_INTERVAL_SEC = 10
-DEFAULT_MAX_SHARDS_PER_NODE = 3000
+DEFAULT_MAX_SHARDS_PER_NODE = 1000
 
 KNOWN_BOTS = {
     "gif",
@@ -56,6 +61,7 @@ ERROR_RE = re.compile(
 )
 SLUG_RE = re.compile(r"[^a-z0-9]+")
 INDEX_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+INDEX_MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
 INDEX_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_\-]{0,200}$")
 
 MESSAGES_MAPPING: dict[str, Any] = {
@@ -130,7 +136,8 @@ CATALOG_MAPPING: dict[str, Any] = {
             },
             "chat_type": {"type": "keyword"},
             "slug": {"type": "keyword"},
-            "message_date": {"type": "date", "format": "yyyy-MM-dd"},
+            "month": {"type": "keyword"},
+            "days": {"type": "keyword"},
             "message_count": {"type": "integer"},
             "skipped_count": {"type": "integer"},
             "date_min": {"type": "date"},
@@ -191,8 +198,10 @@ def derive_slug(path: Path, chat_id: str, chat_name: str, explicit: str | None) 
     return slugify(chat_name, fallback=f"chat{chat_id}")
 
 
-def build_index_name(chat_id: str, slug: str, message_date: str) -> str:
-    name = f"{chat_id}_{slug}_{message_date}".lower()
+def build_index_name(chat_id: str, slug: str, month: str) -> str:
+    if not INDEX_MONTH_RE.match(month):
+        raise ValueError(f"invalid month for index name: {month}")
+    name = f"{chat_id}_{slug}_{month}".lower()
     if not INDEX_NAME_RE.match(name):
         raise ValueError(f"invalid OpenSearch index name: {name}")
     return name
@@ -204,6 +213,10 @@ def message_day(message: dict[str, Any]) -> str | None:
     if INDEX_DATE_RE.match(day):
         return day
     return None
+
+
+def day_to_month(day: str) -> str:
+    return day[:7]
 
 
 def extract_error_codes(text: str) -> list[str]:
@@ -282,7 +295,7 @@ def normalize_message(
     return doc
 
 
-def group_documents_by_day(
+def group_documents_by_month(
     payload: dict[str, Any],
     source_path: Path,
     slug_arg: str | None,
@@ -295,7 +308,7 @@ def group_documents_by_day(
     slug = derive_slug(source_path, chat_id, chat_name, slug_arg)
     skip_service = env_flag("INGEST_SKIP_SERVICE", True)
     skip_empty = env_flag("INGEST_SKIP_EMPTY", True)
-    by_day: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_month: dict[str, list[dict[str, Any]]] = defaultdict(list)
     skipped = 0
     for raw in payload.get("messages") or []:
         if not isinstance(raw, dict):
@@ -313,8 +326,8 @@ def group_documents_by_day(
         if doc is None:
             skipped += 1
             continue
-        by_day[str(doc["message_date"])].append(doc)
-    return chat_id, chat_name, chat_type, slug, dict(by_day), skipped
+        by_month[day_to_month(str(doc["message_date"]))].append(doc)
+    return chat_id, chat_name, chat_type, slug, dict(by_month), skipped
 
 
 class OpenSearchHttp:
@@ -403,29 +416,52 @@ def add_to_alias(client: OpenSearchHttp, alias: str, index_name: str) -> None:
     client.request("POST", "/_aliases", {"actions": [{"add": {"index": index_name, "alias": alias}}]})
 
 
-def existing_day_indices(client: OpenSearchHttp, chat_id: str, slug: str) -> set[str]:
-    prefix = f"{chat_id}_{slug}_".lower()
-    raw = client.request(
-        "GET",
-        f"/_cat/indices/{prefix}*?h=index,docs.count&format=json",
-        ignore_status=(404,),
-    )
-    items: list[dict[str, Any]] = []
-    if isinstance(raw, list):
-        items = [item for item in raw if isinstance(item, dict)]
+def existing_days_in_index(client: OpenSearchHttp, index_name: str) -> set[str]:
+    """Return the set of ``message_date`` days already present in a month index."""
+    if not client.index_exists(index_name):
+        return set()
+    body = {
+        "size": 0,
+        "aggs": {"days": {"terms": {"field": "message_date", "size": 40}}},
+    }
+    raw = client.request("POST", f"/{index_name}/_search", body, ignore_status=(404,))
     days: set[str] = set()
-    for item in items:
-        name = str(item.get("index") or "")
-        try:
-            count = int(item.get("docs.count") or 0)
-        except (TypeError, ValueError):
-            count = 0
-        if count <= 0 or not name.startswith(prefix):
+    if not isinstance(raw, dict):
+        return days
+    buckets = (
+        raw.get("aggregations", {}).get("days", {}).get("buckets", [])
+        if isinstance(raw.get("aggregations"), dict)
+        else []
+    )
+    for bucket in buckets:
+        key = bucket.get("key_as_string") or bucket.get("key")
+        if key is None:
             continue
-        day = name[len(prefix) :]
+        day = str(key)[:10]
         if INDEX_DATE_RE.match(day):
             days.add(day)
     return days
+
+
+def index_month_stats(client: OpenSearchHttp, index_name: str) -> tuple[int, str | None, str | None]:
+    """Return (doc_count, date_min, date_max) for a month index."""
+    body = {
+        "size": 0,
+        "track_total_hits": True,
+        "aggs": {
+            "tmin": {"min": {"field": "timestamp"}},
+            "tmax": {"max": {"field": "timestamp"}},
+        },
+    }
+    raw = client.request("POST", f"/{index_name}/_search", body, ignore_status=(404,))
+    if not isinstance(raw, dict):
+        return 0, None, None
+    total = raw.get("hits", {}).get("total", {})
+    count = int(total.get("value", 0)) if isinstance(total, dict) else int(total or 0)
+    aggs = raw.get("aggregations", {}) if isinstance(raw.get("aggregations"), dict) else {}
+    date_min = aggs.get("tmin", {}).get("value_as_string")
+    date_max = aggs.get("tmax", {}).get("value_as_string")
+    return count, date_min, date_max
 
 
 def ensure_cluster_settings(client: OpenSearchHttp) -> None:
@@ -474,13 +510,14 @@ def write_catalog(
     chat_name: str,
     chat_type: str,
     slug: str,
-    message_date: str,
+    month: str,
+    days: list[str],
     message_count: int,
     skipped_count: int,
     source_file: str,
-    docs: list[dict[str, Any]],
+    date_min: str | None,
+    date_max: str | None,
 ) -> None:
-    timestamps = [doc["timestamp"] for doc in docs if doc.get("timestamp")]
     body = {
         "index_name": index_name,
         "alias": alias,
@@ -488,11 +525,12 @@ def write_catalog(
         "chat_name": chat_name,
         "chat_type": chat_type,
         "slug": slug,
-        "message_date": message_date,
+        "month": month,
+        "days": days,
         "message_count": message_count,
         "skipped_count": skipped_count,
-        "date_min": min(timestamps) if timestamps else None,
-        "date_max": max(timestamps) if timestamps else None,
+        "date_min": date_min,
+        "date_max": date_max,
         "source_file": source_file,
         "imported_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -527,36 +565,48 @@ def import_payload(
     recreate: bool = False,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    chat_id, chat_name, chat_type, resolved_slug, by_day, skipped = group_documents_by_day(
+    chat_id, chat_name, chat_type, resolved_slug, by_month, skipped = group_documents_by_month(
         payload, source_path, slug
     )
     alias = f"{chat_id}_{resolved_slug}".lower()
-    days = sorted(by_day)
+    months = sorted(by_month)
+    all_days = sorted({str(doc["message_date"]) for docs in by_month.values() for doc in docs})
     interval = (
         DEFAULT_CHUNK_INTERVAL_SEC
         if chunk_interval_sec is None
         else chunk_interval_sec
     )
     LOGGER.info(
-        "chat=%s id=%s slug=%s days=%s messages=%s skipped=%s alias=%s",
+        "chat=%s id=%s slug=%s months=%s days=%s messages=%s skipped=%s alias=%s",
         chat_name,
         chat_id,
         resolved_slug,
-        len(days),
-        sum(len(v) for v in by_day.values()),
+        len(months),
+        len(all_days),
+        sum(len(v) for v in by_month.values()),
         skipped,
         alias,
     )
     if dry_run:
-        for day in days:
-            LOGGER.info("dry-run day %s -> %s (%s msgs)", day, build_index_name(chat_id, resolved_slug, day), len(by_day[day]))
+        for month in months:
+            file_days = sorted({str(doc["message_date"]) for doc in by_month[month]})
+            LOGGER.info(
+                "dry-run month %s -> %s (%s msgs, %s days)",
+                month,
+                build_index_name(chat_id, resolved_slug, month),
+                len(by_month[month]),
+                len(file_days),
+            )
         return {
             "chat_id": chat_id,
             "slug": resolved_slug,
             "alias": alias,
-            "days_in_file": days,
+            "months_in_file": months,
+            "days_in_file": all_days,
+            "loaded_months": [],
+            "skipped_months": months,
             "loaded_days": [],
-            "skipped_days": days,
+            "skipped_days": all_days,
             "skipped_messages": skipped,
         }
 
@@ -567,20 +617,36 @@ def import_payload(
     ensure_cluster_settings(client)
     ensure_index(client, CATALOG_INDEX, CATALOG_MAPPING, recreate=False)
 
-    already = existing_day_indices(client, chat_id, resolved_slug)
-    to_load = [day for day in days if day not in already]
-    skipped_days = [day for day in days if day in already]
-    for day in skipped_days:
-        LOGGER.info("skip existing day %s (%s msgs in file)", day, len(by_day[day]))
+    loaded_months: list[str] = []
+    skipped_months: list[str] = []
+    loaded_days: list[str] = []
+    skipped_days: list[str] = []
+    for position, month in enumerate(months):
+        docs = by_month[month]
+        index_name = build_index_name(chat_id, resolved_slug, month)
+        file_days = sorted({str(doc["message_date"]) for doc in docs})
+        existing_days = set() if recreate else existing_days_in_index(client, index_name)
+        docs_to_load = [doc for doc in docs if str(doc["message_date"]) not in existing_days]
+        new_days = sorted({str(doc["message_date"]) for doc in docs_to_load})
+        already_days = [day for day in file_days if day in existing_days]
+        skipped_days.extend(already_days)
 
-    loaded: list[str] = []
-    for index, day in enumerate(to_load):
-        docs = by_day[day]
-        index_name = build_index_name(chat_id, resolved_slug, day)
+        if not docs_to_load and not recreate:
+            LOGGER.info(
+                "skip month %s: all %s day(s) already present in %s",
+                month,
+                len(file_days),
+                index_name,
+            )
+            skipped_months.append(month)
+            continue
+
         ensure_index(client, index_name, MESSAGES_MAPPING, recreate=recreate)
-        indexed = bulk_index(client, index_name, docs)
+        indexed = bulk_index(client, index_name, docs_to_load)
         client.request("POST", f"/{index_name}/_refresh")
         add_to_alias(client, alias, index_name)
+        count, date_min, date_max = index_month_stats(client, index_name)
+        month_days = sorted(set(file_days) | existing_days) if not recreate else file_days
         write_catalog(
             client,
             index_name=index_name,
@@ -589,25 +655,37 @@ def import_payload(
             chat_name=chat_name,
             chat_type=chat_type,
             slug=resolved_slug,
-            message_date=day,
-            message_count=indexed,
+            month=month,
+            days=month_days,
+            message_count=count,
             skipped_count=skipped,
             source_file=str(source_path),
-            docs=docs,
+            date_min=date_min,
+            date_max=date_max,
         )
-        loaded.append(day)
-        LOGGER.info("indexed %s messages into %s", indexed, index_name)
-        if index < len(to_load) - 1 and interval > 0:
-            LOGGER.info("sleep %.1fs before next day", interval)
+        loaded_months.append(month)
+        loaded_days.extend(new_days)
+        LOGGER.info(
+            "indexed %s new message(s) into %s (new days=%s, total docs=%s)",
+            indexed,
+            index_name,
+            len(new_days),
+            count,
+        )
+        if position < len(months) - 1 and interval > 0:
+            LOGGER.info("sleep %.1fs before next month", interval)
             time.sleep(interval)
 
     return {
         "chat_id": chat_id,
         "slug": resolved_slug,
         "alias": alias,
-        "days_in_file": days,
-        "loaded_days": loaded,
-        "skipped_days": skipped_days,
+        "months_in_file": months,
+        "days_in_file": all_days,
+        "loaded_months": loaded_months,
+        "skipped_months": skipped_months,
+        "loaded_days": loaded_days,
+        "skipped_days": sorted(set(skipped_days)),
         "skipped_messages": skipped,
     }
 
@@ -676,8 +754,10 @@ def main(argv: list[str] | None = None) -> int:
         LOGGER.error("%s", exc)
         return 1
     LOGGER.info(
-        "done loaded=%s skipped_days=%s",
+        "done loaded_months=%s loaded_days=%s skipped_months=%s skipped_days=%s",
+        len(stats["loaded_months"]),
         len(stats["loaded_days"]),
+        len(stats["skipped_months"]),
         len(stats["skipped_days"]),
     )
     return 0

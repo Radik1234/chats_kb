@@ -97,9 +97,11 @@ def process_file(path: Path, root: Path, client: OpenSearchHttp, interval: float
         stats = import_file(processing, client=client, chunk_interval_sec=interval)
         archived = move_to_zone(processing, root, "archive", folder, rename=True)
         LOGGER.info(
-            "archived %s loaded_days=%s skipped_days=%s",
+            "archived %s loaded_months=%s loaded_days=%s skipped_months=%s skipped_days=%s",
             archived,
+            len(stats["loaded_months"]),
             len(stats["loaded_days"]),
+            len(stats["skipped_months"]),
             len(stats["skipped_days"]),
         )
     except Exception:
