@@ -149,6 +149,36 @@ services:
         condition: service_healthy
     entrypoint: ["python", "-u", "/app/import_telegram.py"]
 
+  importer:
+    profiles: ["backfill"]
+    build:
+      context: ./services
+      dockerfile: importer/Dockerfile
+    image: onec-kb-importer:local
+    container_name: onec-kb-importer
+    environment:
+      OPENSEARCH_URL: https://opensearch:9200
+      OPENSEARCH_USERNAME: ${OPENSEARCH_USERNAME:-admin}
+      OPENSEARCH_PASSWORD: ${OPENSEARCH_INITIAL_ADMIN_PASSWORD}
+      OPENSEARCH_SSL_VERIFY: "false"
+      INGEST_ROOT: /data/telegram
+      BACKFILL_DAYS_PER_RUN: ${BACKFILL_DAYS_PER_RUN:-7}
+      BACKFILL_INTERVAL_SEC: ${BACKFILL_INTERVAL_SEC:-300}
+      BACKFILL_MIN_RECHECK_SEC: ${BACKFILL_MIN_RECHECK_SEC:-3600}
+      BACKFILL_GUARD_INBOX: ${BACKFILL_GUARD_INBOX:-true}
+      TG_API_ID: ${TG_API_ID:-}
+      TG_API_HASH: ${TG_API_HASH:-}
+      TG_SESSION: ${TG_SESSION:-}
+    volumes:
+      - ./data/telegram:/data/telegram
+    networks:
+      - onec-kb
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    mem_limit: 512m
+    restart: unless-stopped
+
 volumes:
   opensearch-data:
 
