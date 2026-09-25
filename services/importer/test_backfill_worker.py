@@ -222,6 +222,80 @@ def test_run_once_no_messages_updates_state_only():
         assert state["111_demo"]["last_fetched"] == 0
 
 
+class RaisingSource:
+    """Fake source that raises for specific chat ids (inaccessible chats)."""
+
+    def __init__(self, fail_chat_ids, messages=None):
+        self.fail = set(fail_chat_ids)
+        self.messages = messages or []
+        self.calls = []
+
+    def fetch(self, chat_id, slug, min_id, until_date):
+        self.calls.append(chat_id)
+        if chat_id in self.fail:
+            raise RuntimeError(f"ChannelPrivateError: {chat_id} not accessible")
+        meta = {"id": chat_id, "name": "Good", "type": "public_supergroup"}
+        return meta, [m for m in self.messages if m["id"] > min_id]
+
+
+def test_select_chat_error_backoff_skips_future_retry():
+    now = datetime(2026, 2, 1, 12, 0, 0, tzinfo=timezone.utc)
+    chats = [
+        {"alias": "a", "max_message_id": 5, "date_max": "2025-06-01T00:00:00",
+         "last_checked_at": "2026-02-01T11:00:00", "retry_after": "2026-02-01T18:00:00", "error_count": 2},
+        {"alias": "b", "max_message_id": 5, "date_max": "2026-01-20T00:00:00", "last_checked_at": None},
+    ]
+    chosen = bw.select_chat(chats, now, min_recheck_sec=3600)
+    assert chosen["alias"] == "b"  # a is in error backoff despite being most behind
+
+
+def test_run_once_inaccessible_chat_backs_off_not_retried():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        for z in bw.INGEST_ZONES:
+            (root / z).mkdir(parents=True)
+        client = FakeClient(["111_demo"], {"111_demo": {"max_message_id": 100, "date_max": "2026-01-01T00:00:00"}})
+        source = RaisingSource(["111"])
+        config = _config(root)
+        now = datetime(2026, 1, 10, tzinfo=timezone.utc)
+
+        r1 = bw.run_once(client, source, config, now=now)
+        assert r1["status"] == "error" and r1["error_count"] == 1
+        state = json.loads(config.state_path.read_text())
+        assert state["111_demo"]["error_count"] == 1
+        assert "retry_after" in state["111_demo"]
+        assert list((root / "inbox").rglob("*.json")) == []  # nothing written
+
+        # Same cycle time: chat is in error backoff -> not retried, no new fetch.
+        r2 = bw.run_once(client, source, config, now=now)
+        assert r2["status"] == "idle"
+        assert source.calls == ["111"]  # fetched exactly once, no infinite retry
+
+
+def test_run_once_inaccessible_chat_does_not_starve_others():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        for z in bw.INGEST_ZONES:
+            (root / z).mkdir(parents=True)
+        client = FakeClient(
+            ["111_bad", "222_good"],
+            {
+                "111_bad": {"max_message_id": 100, "date_max": "2025-01-01T00:00:00"},   # most behind
+                "222_good": {"max_message_id": 50, "date_max": "2026-01-01T00:00:00"},
+            },
+        )
+        source = RaisingSource(["111"], messages=[{"id": 51, "type": "message", "date": "2026-01-02T00:00:00", "text": "x"}])
+        config = _config(root)
+        now = datetime(2026, 1, 10, tzinfo=timezone.utc)
+
+        r1 = bw.run_once(client, source, config, now=now)
+        assert r1["status"] == "error" and r1["alias"] == "111_bad"  # most behind picked first, fails
+
+        r2 = bw.run_once(client, source, config, now=now)
+        assert r2["status"] == "ok" and r2["alias"] == "222_good"  # good chat still gets served
+        assert list((root / "inbox" / "222_good").glob("*.json"))
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

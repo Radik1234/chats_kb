@@ -81,6 +81,8 @@ class BackfillConfig:
         self.days_per_run = env_int("BACKFILL_DAYS_PER_RUN", 7)
         self.interval_sec = float(env_int("BACKFILL_INTERVAL_SEC", 300))
         self.min_recheck_sec = float(env_int("BACKFILL_MIN_RECHECK_SEC", 3600))
+        # Base error backoff; doubles per consecutive failure, capped at 64x.
+        self.error_backoff_base = float(env_int("BACKFILL_ERROR_BACKOFF_SEC", 900))
         # Guard on inbox as well so at most one backfill file is outstanding.
         self.guard_inbox = env_flag("BACKFILL_GUARD_INBOX", True)
 
@@ -173,16 +175,24 @@ def select_chat(
     now: datetime,
     min_recheck_sec: float,
 ) -> dict[str, Any] | None:
-    """Pick the most behind chat that has a frontier and is not in backoff."""
+    """Pick the most behind chat that has a frontier and is not in backoff.
+
+    A chat is skipped when it was checked less than ``min_recheck_sec`` ago
+    (idle backoff) or while its ``retry_after`` (error backoff) is in the
+    future. This prevents an inaccessible chat from being retried every cycle
+    and from starving the other chats behind it."""
     now = _naive_utc(now)
     eligible: list[dict[str, Any]] = []
     for chat in chats:
         if chat.get("max_message_id") is None:
             continue  # empty alias / nothing indexed yet
+        retry_after = _parse_iso(chat.get("retry_after"))
+        if retry_after is not None and now < retry_after:
+            continue  # error backoff
         last_checked = _parse_iso(chat.get("last_checked_at"))
         if last_checked is not None:
             if (now - last_checked).total_seconds() < min_recheck_sec:
-                continue
+                continue  # idle backoff
         eligible.append(chat)
     if not eligible:
         return None
@@ -257,7 +267,10 @@ def run_once(
 
     for chat in chats:
         chat.update(chat_frontier(client, chat["alias"]))
-        chat["last_checked_at"] = state.get(chat["alias"], {}).get("last_checked_at")
+        entry = state.get(chat["alias"], {})
+        chat["last_checked_at"] = entry.get("last_checked_at")
+        chat["retry_after"] = entry.get("retry_after")
+        chat["error_count"] = entry.get("error_count", 0)
 
     chat = select_chat(chats, now, config.min_recheck_sec)
     if chat is None:
@@ -276,7 +289,29 @@ def run_once(
         until_date.strftime(DATE_FMT),
     )
 
-    chat_meta, messages = source.fetch(chat["chat_id"], chat["slug"], min_id, until_date)
+    entry = state.setdefault(alias, {})
+    entry["last_checked_at"] = now.strftime("%Y-%m-%dT%H:%M:%S")
+    entry["last_max_id"] = min_id
+    entry["last_date_max"] = chat.get("date_max")
+
+    try:
+        chat_meta, messages = source.fetch(chat["chat_id"], chat["slug"], min_id, until_date)
+    except Exception as exc:  # noqa: BLE001 — one bad chat must not stall the queue
+        error_count = int(entry.get("error_count", 0)) + 1
+        factor = min(2 ** (error_count - 1), 64)
+        retry_after = now + timedelta(seconds=config.error_backoff_base * factor)
+        entry["error_count"] = error_count
+        entry["last_error"] = str(exc)[:300]
+        entry["retry_after"] = retry_after.strftime("%Y-%m-%dT%H:%M:%S")
+        save_state(config.state_path, state)
+        LOGGER.warning(
+            "fetch failed for %s (attempt %s): %s — backing off until %s",
+            alias,
+            error_count,
+            exc,
+            entry["retry_after"],
+        )
+        return {"status": "error", "alias": alias, "error": str(exc), "error_count": error_count}
 
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
     result: dict[str, Any] = {"status": "ok", "alias": alias, "fetched": len(messages)}
@@ -289,11 +324,10 @@ def run_once(
     else:
         LOGGER.info("no new messages for %s within window", alias)
 
-    entry = state.setdefault(alias, {})
-    entry["last_checked_at"] = now.strftime("%Y-%m-%dT%H:%M:%S")
-    entry["last_max_id"] = min_id
-    entry["last_date_max"] = chat.get("date_max")
     entry["last_fetched"] = len(messages)
+    entry["error_count"] = 0
+    entry.pop("retry_after", None)
+    entry.pop("last_error", None)
     save_state(config.state_path, state)
     return result
 
