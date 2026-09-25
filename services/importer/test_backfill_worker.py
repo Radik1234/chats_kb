@@ -10,7 +10,7 @@ import json
 import os
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -294,6 +294,37 @@ def test_run_once_inaccessible_chat_does_not_starve_others():
         r2 = bw.run_once(client, source, config, now=now)
         assert r2["status"] == "ok" and r2["alias"] == "222_good"  # good chat still gets served
         assert list((root / "inbox" / "222_good").glob("*.json"))
+
+
+def test_run_once_recovers_when_chat_becomes_available():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        for z in bw.INGEST_ZONES:
+            (root / z).mkdir(parents=True)
+        client = FakeClient(["111_demo"], {"111_demo": {"max_message_id": 100, "date_max": "2026-01-01T00:00:00"}})
+        config = _config(root)  # BACKFILL_ERROR_BACKOFF_SEC default 900
+        config.min_recheck_sec = 0  # isolate the error backoff (retry_after) from idle backoff
+        t0 = datetime(2026, 1, 10, tzinfo=timezone.utc)
+
+        # 1) inaccessible -> parked with a retry_after
+        r1 = bw.run_once(client, RaisingSource(["111"]), config, now=t0)
+        assert r1["status"] == "error"
+        state = json.loads(config.state_path.read_text())
+        assert "retry_after" in state["111_demo"]
+
+        # 2) still inside the backoff window -> skipped, not retried
+        r_mid = bw.run_once(client, RaisingSource(["111"]), config, now=t0 + timedelta(seconds=60))
+        assert r_mid["status"] == "idle"
+
+        # 3) after retry_after, and the chat is reachable again -> resumes normally
+        good = FakeSource([{"id": 101, "type": "message", "date": "2026-01-02T10:00:00", "text": "back"}])
+        r2 = bw.run_once(client, good, config, now=t0 + timedelta(seconds=1000))
+        assert r2["status"] == "ok" and r2["fetched"] == 1
+        assert good.calls[0][2] == 100  # resumed from the exact message_id frontier
+        state = json.loads(config.state_path.read_text())
+        assert state["111_demo"]["error_count"] == 0
+        assert "retry_after" not in state["111_demo"]
+        assert list((root / "inbox" / "111_demo").glob("*.json"))
 
 
 def _run_all():
