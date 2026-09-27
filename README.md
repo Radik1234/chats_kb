@@ -9,6 +9,10 @@
 Официальный OpenSearch MCP подключается профилем `mcp`, когда Docker может
 ходить в PyPI. Эмбеддинги в этой итерации не входят.
 
+Опциональный сервис **importer** (профиль `backfill`) по расписанию в один
+поток дозагружает новые сообщения известных чатов из Telegram в `inbox` —
+см. [фоновую дозагрузку](docs/backfill-worker.md).
+
 ## Быстрый старт (Windows + Docker Desktop)
 
 ```powershell
@@ -31,4 +35,5 @@ Copy-Item chats_history\1393071168_mssqlplus1c\result.json data\telegram\inbox\1
 
 - [Развёртывание](docs/deployment-windows.md)
 - [Импорт любого чата](docs/import-telegram.md)
+- [Фоновая дозагрузка (importer-worker)](docs/backfill-worker.md)
 - [MCP для агентов](docs/mcp-setup.md)
