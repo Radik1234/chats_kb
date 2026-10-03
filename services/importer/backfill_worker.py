@@ -9,8 +9,8 @@ Single-threaded scheduled worker that, on each cycle:
   3. picks the most behind chat (smallest ``date_max``), honouring a per-chat
      recheck backoff so idle chats are not polled every cycle;
   4. computes the exact frontier ``max(message_id)`` for that chat and asks the
-     Telegram source for messages newer than it (``min_id``), bounded to a
-     window of ``BACKFILL_DAYS_PER_RUN`` days;
+     Telegram source for messages newer than it (``min_id``), up to ``now`` and
+     capped at ``BACKFILL_MAX_MESSAGES`` per run;
   5. writes a Telegram-Desktop-export-compatible JSON into
      ``inbox/{chat_id}_{slug}/`` where the existing ``ingest`` picks it up.
 
@@ -54,10 +54,12 @@ class TelegramSource(Protocol):
         slug: str,
         min_id: int,
         until_date: datetime,
+        max_messages: int,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         """Return (chat_meta, messages) for messages with id > ``min_id`` whose
-        date is <= ``until_date``. ``chat_meta`` has name/type/id in Telegram
-        Desktop export shape; ``messages`` is a list of export message dicts."""
+        date is <= ``until_date``, capped at ``max_messages`` entries. ``chat_meta``
+        has name/type/id in Telegram Desktop export shape; ``messages`` is a list of
+        export message dicts."""
         ...
 
 
@@ -79,6 +81,10 @@ class BackfillConfig:
     def __init__(self) -> None:
         self.ingest_root = Path(os.environ.get("INGEST_ROOT", "/data/telegram"))
         self.days_per_run = env_int("BACKFILL_DAYS_PER_RUN", 7)
+        # Per-run batch size limit (count of messages). Replaces the date
+        # window: a chat that was quiet for longer than days_per_run used to
+        # deadlock, because the window never advanced past the silence.
+        self.max_messages = env_int("BACKFILL_MAX_MESSAGES", 2000)
         self.interval_sec = float(env_int("BACKFILL_INTERVAL_SEC", 300))
         self.min_recheck_sec = float(env_int("BACKFILL_MIN_RECHECK_SEC", 3600))
         # Base error backoff; doubles per consecutive failure, capped at 64x.
@@ -279,14 +285,18 @@ def run_once(
 
     alias = chat["alias"]
     min_id = int(chat["max_message_id"])
-    date_max = _parse_iso(chat.get("date_max")) or now
-    until_date = date_max + timedelta(days=config.days_per_run)
+    # Fetch up to "now" and cap the run by message count: the frontier is a
+    # message_id, so a quiet gap in the chat is crossed by simply walking the id
+    # range. The leftover is picked up by the next passes (min_id = last accepted
+    # id), so no run can exceed max_messages.
+    until_date = now
     LOGGER.info(
-        "selected %s: min_id=%s date_max=%s window_until=%s",
+        "selected %s: min_id=%s date_max=%s until=%s max_messages=%s",
         alias,
         min_id,
         chat.get("date_max"),
         until_date.strftime(DATE_FMT),
+        config.max_messages,
     )
 
     entry = state.setdefault(alias, {})
@@ -295,7 +305,9 @@ def run_once(
     entry["last_date_max"] = chat.get("date_max")
 
     try:
-        chat_meta, messages = source.fetch(chat["chat_id"], chat["slug"], min_id, until_date)
+        chat_meta, messages = source.fetch(
+            chat["chat_id"], chat["slug"], min_id, until_date, config.max_messages
+        )
     except Exception as exc:  # noqa: BLE001 — one bad chat must not stall the queue
         error_count = int(entry.get("error_count", 0)) + 1
         factor = min(2 ** (error_count - 1), 64)
@@ -322,7 +334,7 @@ def run_once(
         result["written"] = str(dest)
         LOGGER.info("wrote %s messages -> %s", len(messages), dest)
     else:
-        LOGGER.info("no new messages for %s within window", alias)
+        LOGGER.info("no new messages for %s (frontier reached)", alias)
 
     entry["last_fetched"] = len(messages)
     entry["error_count"] = 0
@@ -366,9 +378,9 @@ def main() -> int:
     client = OpenSearchHttp()
     source = _make_source()
     LOGGER.info(
-        "backfill worker started root=%s days_per_run=%s interval=%.0fs recheck=%.0fs",
+        "backfill worker started root=%s max_messages=%s interval=%.0fs recheck=%.0fs",
         config.ingest_root,
-        config.days_per_run,
+        config.max_messages,
         config.interval_sec,
         config.min_recheck_sec,
     )
