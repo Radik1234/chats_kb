@@ -21,6 +21,10 @@ LOGGER = logging.getLogger("telegram_source")
 
 DATE_FMT = "%Y-%m-%dT%H:%M:%S"
 
+# Fallback batch size when the caller passes nothing; the worker normally
+# supplies ``BACKFILL_MAX_MESSAGES`` (see backfill_worker.BackfillConfig).
+DEFAULT_MAX_MESSAGES = 2000
+
 # Telegram Desktop export "type" per Telethon entity class name.
 _ENTITY_TYPE = {
     "Channel": "public_supergroup",
@@ -140,6 +144,7 @@ class TelethonSource:
         slug: str,
         min_id: int,
         until_date: datetime,
+        max_messages: int = DEFAULT_MAX_MESSAGES,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         messages: list[dict[str, Any]] = []
         with self._client() as client:
@@ -150,11 +155,16 @@ class TelethonSource:
                 "type": _ENTITY_TYPE.get(type(entity).__name__, "unknown"),
             }
             for msg in client.iter_messages(entity, min_id=min_id, reverse=True):
+                if len(messages) >= max_messages:
+                    # iter_messages is a lazy generator: bailing out here keeps
+                    # the run bounded by count, so a quiet gap in the chat is
+                    # jumped over instead of truncating the run to zero.
+                    break
                 mdate = getattr(msg, "date", None)
                 if isinstance(mdate, datetime):
                     naive = mdate.astimezone(timezone.utc).replace(tzinfo=None) if mdate.tzinfo else mdate
                     if naive > until_date:
-                        break  # reached the end of this run's day-window
+                        break  # future-dated message, nothing newer is wanted
                 doc = message_to_export(msg)
                 if doc is not None:
                     messages.append(doc)

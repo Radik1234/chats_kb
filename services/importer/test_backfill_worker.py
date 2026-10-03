@@ -17,7 +17,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import backfill_worker as bw
-from telegram_source import message_to_export
+from telegram_source import TelethonSource, message_to_export
 
 
 # --------------------------------------------------------------------------- #
@@ -147,19 +147,22 @@ class FakeSource:
         self._messages = messages
         self.calls = []
 
-    def fetch(self, chat_id, slug, min_id, until_date):
-        self.calls.append((chat_id, slug, min_id, until_date))
+    def fetch(self, chat_id, slug, min_id, until_date, max_messages=None):
+        self.calls.append((chat_id, slug, min_id, until_date, max_messages))
         meta = {"id": chat_id, "name": "Demo", "type": "public_supergroup"}
         # simulate min_id filter
         msgs = [m for m in self._messages if m["id"] > min_id]
+        if max_messages is not None:
+            msgs = msgs[:max_messages]
         return meta, msgs
 
 
-def _config(root: Path) -> bw.BackfillConfig:
+def _config(root: Path, max_messages: int = 2000) -> bw.BackfillConfig:
     os.environ["INGEST_ROOT"] = str(root)
     os.environ["BACKFILL_DAYS_PER_RUN"] = "7"
     os.environ["BACKFILL_MIN_RECHECK_SEC"] = "3600"
     os.environ["BACKFILL_GUARD_INBOX"] = "true"
+    os.environ["BACKFILL_MAX_MESSAGES"] = str(max_messages)
     return bw.BackfillConfig()
 
 
@@ -230,12 +233,15 @@ class RaisingSource:
         self.messages = messages or []
         self.calls = []
 
-    def fetch(self, chat_id, slug, min_id, until_date):
+    def fetch(self, chat_id, slug, min_id, until_date, max_messages=None):
         self.calls.append(chat_id)
         if chat_id in self.fail:
             raise RuntimeError(f"ChannelPrivateError: {chat_id} not accessible")
         meta = {"id": chat_id, "name": "Good", "type": "public_supergroup"}
-        return meta, [m for m in self.messages if m["id"] > min_id]
+        msgs = [m for m in self.messages if m["id"] > min_id]
+        if max_messages is not None:
+            msgs = msgs[:max_messages]
+        return meta, msgs
 
 
 def test_select_chat_error_backoff_skips_future_retry():
@@ -325,6 +331,202 @@ def test_run_once_recovers_when_chat_becomes_available():
         assert state["111_demo"]["error_count"] == 0
         assert "retry_after" not in state["111_demo"]
         assert list((root / "inbox" / "111_demo").glob("*.json"))
+
+
+# --------------------------------------------------------------------------- #
+# Ограничение порции: BACKFILL_MAX_MESSAGES (issue #8)
+# --------------------------------------------------------------------------- #
+def test_config_max_messages_default_is_2000():
+    previous = os.environ.pop("BACKFILL_MAX_MESSAGES", None)
+    try:
+        assert bw.BackfillConfig().max_messages == 2000
+    finally:
+        if previous is not None:
+            os.environ["BACKFILL_MAX_MESSAGES"] = previous
+
+
+def test_config_max_messages_read_from_env():
+    previous = os.environ.get("BACKFILL_MAX_MESSAGES")
+    os.environ["BACKFILL_MAX_MESSAGES"] = "500"
+    try:
+        assert bw.BackfillConfig().max_messages == 500
+    finally:
+        if previous is None:
+            os.environ.pop("BACKFILL_MAX_MESSAGES", None)
+        else:
+            os.environ["BACKFILL_MAX_MESSAGES"] = previous
+
+
+def _drain_inbox(root: Path) -> None:
+    """Имитирует ingest: увёл накопленные файлы из inbox в archive."""
+    for path in (root / "inbox").rglob("*.json"):
+        dest_dir = root / "archive" / path.parent.name
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        path.replace(dest_dir / path.name)
+
+
+def test_run_once_crosses_quiet_gap():
+    """Репродукция issue #8: чат молчал с 26.08 по 02.09, при date_max=25.08 и
+    days_per_run=5 старое окно обрывало итерацию на первом же сообщении после
+    разрыва и воркер вечно получал fetched 0."""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        for z in bw.INGEST_ZONES:
+            (root / z).mkdir(parents=True)
+        client = FakeClient(
+            ["1393071168_mssqlplus1c"],
+            {"1393071168_mssqlplus1c": {"max_message_id": 35706, "date_max": "2026-08-25T00:00:00"}},
+        )
+        # Сообщения после разрыва тишины: с 03.09 по 25.09.
+        after_gap = [
+            {"id": 35729, "type": "message", "date": "2026-09-03T09:00:00", "text": "back from silence"},
+            {"id": 35730, "type": "message", "date": "2026-09-25T10:00:00", "text": "latest"},
+        ]
+        source = FakeSource(after_gap)
+        config = _config(root)
+        config.days_per_run = 5  # как в проде из issue
+        now = datetime(2026, 10, 3, 12, 0, tzinfo=timezone.utc)
+
+        result = bw.run_once(client, source, config, now=now)
+
+        assert result["status"] == "ok"
+        # Старый код здесь получал fetched 0 (окно date_max+5 дней = 30.08).
+        assert result["fetched"] == 2
+        # until_date теперь = now, а не date_max + days_per_run.
+        until = source.calls[0][3]
+        assert until == datetime(2026, 10, 3, 12, 0), until
+        assert until != datetime(2026, 8, 30, 12, 0)
+        # Файл записан, сообщения после разрыва попали в базу.
+        export = json.loads(list((root / "inbox" / "1393071168_mssqlplus1c").glob("*.json"))[0].read_text())
+        assert [m["id"] for m in export["messages"]] == [35729, 35730]
+
+
+def test_run_once_limits_portion_and_next_pass_takes_the_rest():
+    """Порция режется по количеству, остаток дозабирается следующими проходами."""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        for z in bw.INGEST_ZONES:
+            (root / z).mkdir(parents=True)
+        messages = [{"id": i, "type": "message", "date": "2026-01-02T00:00:00", "text": "m"} for i in range(1, 5001)]
+        now = datetime(2026, 1, 10, tzinfo=timezone.utc)
+        config = _config(root, max_messages=2000)
+        config.min_recheck_sec = 0  # изолируем разбиение порции от idle-backoff
+
+        # Проход 1: фронтиер 0, отдаём ровно 2000.
+        c1 = FakeClient(["111_demo"], {"111_demo": {"max_message_id": 0, "date_max": "2025-12-31T00:00:00"}})
+        s1 = FakeSource(messages)
+        r1 = bw.run_once(c1, s1, config, now=now)
+        assert r1["fetched"] == 2000
+        assert s1.calls[0][4] == 2000  # лимит передан в источник
+
+        # Проход 2: граница = id последнего принятого, доберём следующие 2000.
+        # Файл предыдущего прохода ingest уже увёл в archive — иначе single-flight.
+        _drain_inbox(root)
+        c2 = FakeClient(["111_demo"], {"111_demo": {"max_message_id": 2000, "date_max": "2026-01-02T00:00:00"}})
+        s2 = FakeSource(messages)
+        r2 = bw.run_once(c2, s2, config, now=now + timedelta(minutes=5))
+        assert r2["fetched"] == 2000
+        assert s2.calls[0][2] == 2000  # min_id = 2000
+
+        # Проход 3: остаток 1000.
+        _drain_inbox(root)
+        c3 = FakeClient(["111_demo"], {"111_demo": {"max_message_id": 4000, "date_max": "2026-01-02T00:00:00"}})
+        s3 = FakeSource(messages)
+        r3 = bw.run_once(c3, s3, config, now=now + timedelta(minutes=10))
+        assert r3["fetched"] == 1000  # хвост короче лимита
+
+        # Проход 4: фронтиер достигнут.
+        _drain_inbox(root)
+        c4 = FakeClient(["111_demo"], {"111_demo": {"max_message_id": 5000, "date_max": "2026-01-02T00:00:00"}})
+        s4 = FakeSource(messages)
+        r4 = bw.run_once(c4, s4, config, now=now + timedelta(minutes=15))
+        assert r4["fetched"] == 0
+
+
+class _FakeTelethonClient:
+    """Минимальный клиент для TelethonSource.fetch (без сети)."""
+
+    def __init__(self, msgs, chat_id="111"):
+        self._msgs = msgs
+        self._chat_id = int(chat_id)
+        self.yielded = 0  # сколько сообщений реально вытянул генератор
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def iter_dialogs(self):
+        return [SimpleNamespace(entity=SimpleNamespace(id=self._chat_id, title="Demo"))]
+
+    def iter_messages(self, entity, min_id=0, reverse=True):
+        for m in self._msgs:
+            self.yielded += 1
+            yield m
+
+
+def _telethon_source_with(msgs, chat_id="111"):
+    source = TelethonSource(api_id=1, api_hash="hash", session="sess")
+    client = _FakeTelethonClient(msgs, chat_id=chat_id)
+    source._client = lambda: client  # noqa: SLF001 — подменяем сеть в тесте
+    return source, client
+
+
+def _msg(i, date):
+    return SimpleNamespace(
+        id=i,
+        date=datetime(*date),
+        message=f"m{i}",
+        entities=None,
+        reply_to=None,
+        action=None,
+        sender_id=None,
+        sender=None,
+        fwd_from=None,
+        photo=None,
+    )
+
+
+def test_telethon_fetch_stops_at_max_messages():
+    """Обрезка по количеству прямо в цикле: лишние страницы не запрашиваются."""
+    until = datetime(2026, 10, 3, 12, 0)
+    base = datetime(2026, 1, 1, 0, 0)
+    msgs = [_msg(i, (base + timedelta(minutes=i)).timetuple()[:6]) for i in range(5000)]
+    source, client = _telethon_source_with(msgs)
+
+    _, messages = source.fetch("111", "demo", min_id=0, until_date=until, max_messages=2000)
+
+    assert len(messages) == 2000
+    # Ленивый генератор не вытянут до конца: остановились на ~2001-м сообщении.
+    assert client.yielded <= 2001, client.yielded
+    assert client.yielded < 5000
+
+
+def test_telethon_fetch_quiet_gap_returns_later_messages():
+    """Разрыв тишины больше любого окна не обрывает итерацию."""
+    until = datetime(2026, 10, 3, 12, 0)
+    msgs = [
+        _msg(1, (2026, 8, 24, 10, 0)),
+        _msg(2, (2026, 9, 3, 10, 0)),   # после 10-дневного молчания
+        _msg(3, (2026, 9, 25, 10, 0)),
+    ]
+    source, _client = _telethon_source_with(msgs)
+
+    _, messages = source.fetch("111", "demo", min_id=0, until_date=until, max_messages=2000)
+
+    assert [m["id"] for m in messages] == [1, 2, 3]
+
+
+def test_telethon_fetch_default_max_messages_is_2000():
+    until = datetime(2026, 10, 3, 12, 0)
+    msgs = [_msg(i, (2026, 9, 1, 12, 0)) for i in range(2500)]
+    source, _client = _telethon_source_with(msgs)
+
+    # Лимит не передан — используется значение по умолчанию.
+    _, messages = source.fetch("111", "demo", min_id=0, until_date=until)
+
+    assert len(messages) == 2000
 
 
 def _run_all():
